@@ -28,6 +28,7 @@ from pathlib import Path
 
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
 
 from model import DriftDiT_models
 from utils import load_checkpoint, save_image_grid, set_seed
@@ -119,6 +120,133 @@ def generate_comparison_grid(
     return torch.cat(interleaved, dim=0), raw, guided
 
 
+def _to_display_image(x: torch.Tensor) -> np.ndarray:
+    """Convert one CHW image in [-1, 1] to a displayable numpy image."""
+    x = ((x.detach().cpu().float() + 1.0) / 2.0).clamp(0, 1)
+    if x.shape[0] == 1:
+        return x.squeeze(0).numpy()
+    return x.permute(1, 2, 0).numpy()
+
+
+def save_sweep_image_grid(
+    rows: list,
+    path: Path,
+):
+    """Save a labelled raw/guided sweep grid for visual inspection."""
+    n_rows = len(rows)
+    n_cols = rows[0][1].shape[0]
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(1.35 * n_cols, 1.35 * n_rows),
+        squeeze=False,
+    )
+
+    for row_idx, (label, images) in enumerate(rows):
+        for col_idx in range(n_cols):
+            image = _to_display_image(images[col_idx])
+            ax = axes[row_idx, col_idx]
+            ax.imshow(image, cmap="gray" if image.ndim == 2 else None)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            if col_idx == 0:
+                ax.set_ylabel(label, rotation=0, ha="right", va="center", labelpad=38)
+
+    fig.tight_layout(pad=0.35)
+    fig.savefig(path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_sweep_metric_plot(results: dict, path: Path):
+    """Save metric curves for a guidance-scale sweep."""
+    scales = list(results.keys())
+    energy_raw = [results[s]["energy_raw"] for s in scales]
+    energy_guided = [results[s]["energy_guided"] for s in scales]
+    reduction = [100.0 * results[s]["energy_reduction"] for s in scales]
+    psnr = [results[s]["psnr_guided_vs_raw"] for s in scales]
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.2))
+
+    axes[0].plot(scales, energy_raw, marker="o", label="raw")
+    axes[0].plot(scales, energy_guided, marker="o", label="guided")
+    axes[0].set_title("Energy")
+    axes[0].set_xlabel("guidance scale")
+    axes[0].legend()
+
+    axes[1].plot(scales, reduction, marker="o", color="tab:green")
+    axes[1].set_title("Energy reduction")
+    axes[1].set_xlabel("guidance scale")
+    axes[1].set_ylabel("%")
+
+    axes[2].plot(scales, psnr, marker="o", color="tab:red")
+    axes[2].set_title("PSNR vs raw")
+    axes[2].set_xlabel("guidance scale")
+    axes[2].set_ylabel("dB")
+
+    for ax in axes:
+        ax.grid(alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_sweep_visualizations(
+    model,
+    energy_fn,
+    z: torch.Tensor,
+    labels: torch.Tensor,
+    guidance_scales: list,
+    results: dict,
+    output_dir: Path,
+    energy_name: str,
+    alpha: float,
+    grad_clip: float,
+    n_steps: int,
+    step_decay: float,
+    normalize_grad: bool,
+    cpu_rng_state: torch.Tensor,
+    cuda_rng_state: torch.Tensor,
+    max_images: int = 8,
+):
+    """Save image and metric visualizations for a guidance sweep."""
+    n_show = min(max_images, z.shape[0])
+    z_show = z[:n_show]
+    labels_show = labels[:n_show]
+    rng_devices = []
+    if z.is_cuda:
+        rng_devices = [z.device.index if z.device.index is not None else torch.cuda.current_device()]
+
+    rows = []
+    for idx, gs in enumerate(guidance_scales):
+        sampler = EnergyGuidedSampler(
+            model=model,
+            energy_fn=energy_fn,
+            guidance_scale=gs,
+            grad_clip=grad_clip,
+            n_steps=n_steps,
+            step_decay=step_decay,
+            normalize_grad=normalize_grad,
+        )
+        with torch.random.fork_rng(devices=rng_devices, enabled=True):
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, device=z.device)
+            guided, raw = sampler.sample(
+                z_show, labels_show, alpha=alpha, return_intermediates=True
+            )
+        if idx == 0:
+            rows.append(("raw", raw.clamp(-1, 1)))
+        reduction = 100.0 * results[gs]["energy_reduction"]
+        rows.append((f"gs={gs:g}\n-{reduction:.1f}%", guided.clamp(-1, 1)))
+
+    grid_path = output_dir / f"sweep_grid_{energy_name}.png"
+    metric_path = output_dir / f"sweep_metrics_{energy_name}.png"
+    save_sweep_image_grid(rows, grid_path)
+    save_sweep_metric_plot(results, metric_path)
+    return grid_path, metric_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="Energy-Guided Sampling for Drifting Models")
     parser.add_argument("--checkpoint", type=str, required=True)
@@ -163,6 +291,12 @@ def main():
         default=[0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0],
         help="Guidance scales to sweep over",
     )
+    parser.add_argument(
+        "--sweep_vis_samples",
+        type=int,
+        default=8,
+        help="Number of samples to show in the sweep visualization grid",
+    )
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -196,6 +330,8 @@ def main():
         print("\n--- Guidance Scale Sweep ---")
         z = torch.randn(num_classes * 4, in_channels, img_size, img_size, device=device)
         labels = torch.arange(num_classes, device=device).repeat_interleave(4)
+        sweep_cpu_rng_state = torch.get_rng_state()
+        sweep_cuda_rng_state = torch.cuda.get_rng_state(z.device) if z.is_cuda else None
 
         results = run_guidance_sweep(
             model, energy_fn, z, labels,
@@ -205,6 +341,8 @@ def main():
             n_steps=args.n_steps,
             step_decay=args.step_decay,
             normalize_grad=args.normalize_grad,
+            cpu_rng_state=sweep_cpu_rng_state,
+            cuda_rng_state=sweep_cuda_rng_state,
         )
 
         # Save metric summary
@@ -216,6 +354,26 @@ def main():
                     f"{m['energy_reduction']:.4f},{m['psnr_guided_vs_raw']:.2f}\n"
                 )
         print(f"Sweep results saved to {output_dir / 'sweep_results.txt'}")
+        grid_path, metric_path = save_sweep_visualizations(
+            model=model,
+            energy_fn=energy_fn,
+            z=z,
+            labels=labels,
+            guidance_scales=args.sweep_scales,
+            results=results,
+            output_dir=output_dir,
+            energy_name=args.energy_fn,
+            alpha=args.alpha,
+            grad_clip=args.grad_clip,
+            n_steps=args.n_steps,
+            step_decay=args.step_decay,
+            normalize_grad=args.normalize_grad,
+            cpu_rng_state=sweep_cpu_rng_state,
+            cuda_rng_state=sweep_cuda_rng_state,
+            max_images=args.sweep_vis_samples,
+        )
+        print(f"Sweep image grid saved to {grid_path}")
+        print(f"Sweep metric plot saved to {metric_path}")
         return
 
     # -----------------------------------------------------------------------

@@ -389,6 +389,8 @@ def run_guidance_sweep(
     n_steps: int = 1,
     step_decay: float = 0.7,
     normalize_grad: bool = True,
+    cpu_rng_state: Optional[torch.Tensor] = None,
+    cuda_rng_state: Optional[torch.Tensor] = None,
 ) -> dict:
     """
     Sweep over guidance_scale values and return metrics for each.
@@ -398,6 +400,14 @@ def run_guidance_sweep(
         dict mapping guidance_scale -> metrics dict
     """
     results = {}
+    if cpu_rng_state is None:
+        cpu_rng_state = torch.get_rng_state()
+    if cuda_rng_state is None and z.is_cuda:
+        cuda_rng_state = torch.cuda.get_rng_state(z.device)
+    rng_devices = []
+    if z.is_cuda:
+        rng_devices = [z.device.index if z.device.index is not None else torch.cuda.current_device()]
+
     for gs in guidance_scales:
         sampler = EnergyGuidedSampler(
             model,
@@ -408,7 +418,18 @@ def run_guidance_sweep(
             step_decay=step_decay,
             normalize_grad=normalize_grad,
         )
-        x_guided, x_raw = sampler.sample(z, labels, alpha=alpha, return_intermediates=True)
+
+        # Keep stochastic style embeddings identical across scales. Otherwise
+        # E_raw changes per row and the sweep mixes scale effects with sampling
+        # noise from the model's random StyleEmbedder.
+        with torch.random.fork_rng(devices=rng_devices, enabled=True):
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, device=z.device)
+            x_guided, x_raw = sampler.sample(
+                z, labels, alpha=alpha, return_intermediates=True
+            )
+
         metrics = compute_guidance_metrics(x_raw, x_guided, energy_fn)
         results[gs] = metrics
         print(
