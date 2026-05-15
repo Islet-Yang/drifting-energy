@@ -38,6 +38,10 @@ class EnergyFn(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
+    def per_sample(self, x: torch.Tensor) -> torch.Tensor:
+        """Return one energy value per sample, shape (B,)."""
+        return self.forward(x).expand(x.shape[0])
+
 
 # ---------------------------------------------------------------------------
 # Concrete energy functions
@@ -71,11 +75,14 @@ class ColorEnergyFn(EnergyFn):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, H, W)  values in [-1, 1]
+        return self.per_sample(x).mean()
+
+    def per_sample(self, x: torch.Tensor) -> torch.Tensor:
         mean_color = x.mean(dim=[2, 3])              # (B, C)
-        target = self.target_color.to(x.device)      # (C,)
-        diff = (mean_color - target) * self.channel_weights.to(x.device)
-        energy = (diff ** 2).sum(dim=1).mean()        # scalar
-        return energy
+        target = self.target_color.to(device=x.device, dtype=x.dtype)      # (C,)
+        weights = self.channel_weights.to(device=x.device, dtype=x.dtype)
+        diff = (mean_color - target) * weights
+        return (diff ** 2).sum(dim=1)
 
 
 class GrayscaleEnergyFn(EnergyFn):
@@ -85,11 +92,14 @@ class GrayscaleEnergyFn(EnergyFn):
     Only meaningful for RGB (3-channel) images.
     """
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.per_sample(x).mean()
+
+    def per_sample(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[1] != 3:
-            return torch.tensor(0.0, device=x.device)
+            return torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
         r, g, b = x[:, 0], x[:, 1], x[:, 2]
-        energy = ((r - g).abs() + (g - b).abs() + (b - r).abs()).mean()
-        return energy
+        energy = (r - g).abs() + (g - b).abs() + (b - r).abs()
+        return energy.flatten(1).mean(dim=1)
 
 
 class EdgeEnergyFn(EnergyFn):
@@ -111,12 +121,15 @@ class EdgeEnergyFn(EnergyFn):
 
     def _laplacian(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        k = self.kernel.to(x.device).expand(C, 1, 3, 3)
+        k = self.kernel.to(device=x.device, dtype=x.dtype).expand(C, 1, 3, 3)
         return F.conv2d(x, k, padding=1, groups=C)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.per_sample(x).mean()
+
+    def per_sample(self, x: torch.Tensor) -> torch.Tensor:
         lap = self._laplacian(x)
-        edge_energy = lap.abs().mean()
+        edge_energy = lap.abs().flatten(1).mean(dim=1)
         return -edge_energy if self.negative_mode else edge_energy
 
 
@@ -136,6 +149,9 @@ class FrequencyEnergyFn(EnergyFn):
         self.penalise_high = penalise_high
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.per_sample(x).mean()
+
+    def per_sample(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         # 2D FFT
         fft = torch.fft.fft2(x, norm="ortho")
@@ -155,8 +171,7 @@ class FrequencyEnergyFn(EnergyFn):
         else:
             mask = (dist <= threshold).float()
 
-        energy = (magnitude * mask).mean()
-        return energy
+        return (magnitude * mask).flatten(1).mean(dim=1)
 
 
 class CompositeEnergyFn(EnergyFn):
@@ -175,9 +190,12 @@ class CompositeEnergyFn(EnergyFn):
         self.weights = [w for _, w in fns_and_weights]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        total = torch.tensor(0.0, device=x.device)
+        return self.per_sample(x).mean()
+
+    def per_sample(self, x: torch.Tensor) -> torch.Tensor:
+        total = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
         for fn, w in zip(self.fns, self.weights):
-            total = total + w * fn(x)
+            total = total + w * fn.per_sample(x)
         return total
 
 
@@ -200,10 +218,12 @@ class EnergyGuidedSampler:
         model:           Trained DriftDiT model (in eval mode).
         energy_fn:       EnergyFn instance defining the guidance objective.
         guidance_scale:  Step size α for gradient descent on E.
-        grad_clip:       Max L2 norm of the gradient (for manifold stability).
+        grad_clip:       Clip value for the normalized gradient direction.
         n_steps:         Number of gradient steps to apply (default 1).
                          More steps = stronger guidance but risk of artifacts.
         step_decay:      Decay factor for guidance_scale across steps.
+        normalize_grad:  If True, normalize each sample's gradient to unit RMS
+                         before clipping, so guidance_scale is image-scale.
     """
 
     def __init__(
@@ -214,6 +234,7 @@ class EnergyGuidedSampler:
         grad_clip: float = 0.5,
         n_steps: int = 1,
         step_decay: float = 0.7,
+        normalize_grad: bool = True,
     ):
         self.model = model
         self.energy_fn = energy_fn
@@ -221,6 +242,7 @@ class EnergyGuidedSampler:
         self.grad_clip = grad_clip
         self.n_steps = n_steps
         self.step_decay = step_decay
+        self.normalize_grad = normalize_grad
 
     @torch.no_grad()
     def _generate_raw(
@@ -245,14 +267,30 @@ class EnergyGuidedSampler:
         x is detached from the original graph; we create a fresh leaf for autograd.
         """
         x_leaf = x.detach().requires_grad_(True)
-        energy = self.energy_fn(x_leaf)
-        energy.backward()
-        grad = x_leaf.grad.detach()
+        # Sum per-sample energies so the guidance strength does not shrink when
+        # batch size changes. Plain forward() returns a batch mean for reporting.
+        energy = self.energy_fn.per_sample(x_leaf).sum()
+        if not energy.requires_grad:
+            return torch.zeros_like(x)
+        grad = torch.autograd.grad(energy, x_leaf, allow_unused=True)[0]
+        if grad is None:
+            return torch.zeros_like(x)
+        grad = grad.detach()
 
-        # Gradient clipping: project to ball of radius grad_clip
-        grad_norm = grad.norm(p=2, dim=[1, 2, 3], keepdim=True).clamp(min=1e-8)
-        scale = torch.clamp(self.grad_clip / grad_norm, max=1.0)
-        grad = grad * scale
+        if self.normalize_grad:
+            # Pixel-space energies such as mean colour have gradients scaled by
+            # 1 / (H * W). Normalize the direction so guidance_scale controls
+            # the actual image-space intervention size.
+            grad_rms = grad.pow(2).mean(dim=[1, 2, 3], keepdim=True).sqrt()
+            grad = grad / grad_rms.clamp(min=1e-8)
+            if self.grad_clip is not None:
+                grad = grad.clamp(min=-self.grad_clip, max=self.grad_clip)
+        elif self.grad_clip is not None:
+            # Backward-compatible L2 clipping for users who disable
+            # normalization and want raw energy-gradient steps.
+            grad_norm = grad.norm(p=2, dim=[1, 2, 3], keepdim=True).clamp(min=1e-8)
+            scale = torch.clamp(self.grad_clip / grad_norm, max=1.0)
+            grad = grad * scale
 
         return grad
 
@@ -347,6 +385,10 @@ def run_guidance_sweep(
     labels: torch.Tensor,
     guidance_scales: list,
     alpha: float = 1.5,
+    grad_clip: Optional[float] = 0.5,
+    n_steps: int = 1,
+    step_decay: float = 0.7,
+    normalize_grad: bool = True,
 ) -> dict:
     """
     Sweep over guidance_scale values and return metrics for each.
@@ -357,7 +399,15 @@ def run_guidance_sweep(
     """
     results = {}
     for gs in guidance_scales:
-        sampler = EnergyGuidedSampler(model, energy_fn, guidance_scale=gs)
+        sampler = EnergyGuidedSampler(
+            model,
+            energy_fn,
+            guidance_scale=gs,
+            grad_clip=grad_clip,
+            n_steps=n_steps,
+            step_decay=step_decay,
+            normalize_grad=normalize_grad,
+        )
         x_guided, x_raw = sampler.sample(z, labels, alpha=alpha, return_intermediates=True)
         metrics = compute_guidance_metrics(x_raw, x_guided, energy_fn)
         results[gs] = metrics

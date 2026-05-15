@@ -135,7 +135,7 @@ def main():
     )
     parser.add_argument(
         "--grad_clip", type=float, default=0.5,
-        help="Max L2 norm of energy gradient (prevents off-manifold artifacts)",
+        help="Clip value for the normalized energy-gradient direction",
     )
     parser.add_argument(
         "--n_steps", type=int, default=1,
@@ -144,6 +144,12 @@ def main():
     parser.add_argument(
         "--step_decay", type=float, default=0.7,
         help="Decay factor for guidance_scale across steps",
+    )
+    parser.add_argument(
+        "--no_normalize_grad",
+        action="store_false",
+        dest="normalize_grad",
+        help="Use raw energy gradients with per-sample L2 clipping",
     )
     parser.add_argument("--alpha", type=float, default=1.5, help="CFG scale")
     parser.add_argument("--samples_per_class", type=int, default=8)
@@ -180,6 +186,7 @@ def main():
         grad_clip=args.grad_clip,
         n_steps=args.n_steps,
         step_decay=args.step_decay,
+        normalize_grad=args.normalize_grad,
     )
 
     # -----------------------------------------------------------------------
@@ -194,6 +201,10 @@ def main():
             model, energy_fn, z, labels,
             guidance_scales=args.sweep_scales,
             alpha=args.alpha,
+            grad_clip=args.grad_clip,
+            n_steps=args.n_steps,
+            step_decay=args.step_decay,
+            normalize_grad=args.normalize_grad,
         )
 
         # Save metric summary
@@ -236,7 +247,8 @@ def main():
         f.write(f"Energy fn:      {args.energy_fn}\n")
         f.write(f"Guidance scale: {args.guidance_scale}\n")
         f.write(f"Grad clip:      {args.grad_clip}\n")
-        f.write(f"N steps:        {args.n_steps}\n\n")
+        f.write(f"N steps:        {args.n_steps}\n")
+        f.write(f"Normalize grad: {args.normalize_grad}\n\n")
         for k, v in metrics.items():
             f.write(f"{k}: {v:.4f}\n")
     print(f"Metrics saved to {output_dir / 'metrics.txt'}")
