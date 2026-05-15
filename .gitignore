@@ -14,6 +14,9 @@ data/
 # Outputs
 outputs/
 
+# Sample outputs (新增)
+samples_energy/
+
 # IDE
 .vscode/
 .idea/
